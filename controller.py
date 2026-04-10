@@ -1,122 +1,154 @@
+#!/usr/bin/env python3
+"""
+Xbox Controller to Arduino Servo Bridge
+- 100Hz update loop via background gamepad thread
+- Fast but controllable speeds
+"""
+
 import serial
 import time
-import pygame
 import threading
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import numpy as np
+from inputs import get_gamepad
 
-PORT = 'COM7'
-BAUD = 115200
-CENTER = 375
+# ========== CONFIGURATION ==========
+ARDUINO_PORT = 'COM3'
+BAUD_RATE = 115200
 
-# track all 5 servos
-servo_pos = [CENTER] * 5
-running = True
+AXIS_MAP = {
+    'ABS_X':  0,
+    'ABS_Y':  1,
+    'ABS_RX': 2
+}
 
-try:
-    ser = serial.Serial(PORT, BAUD, timeout=0)
-    ser.set_buffer_size(rx_size=12800, tx_size=12800)
-    print(f"bot connected on {PORT}")
-except Exception as e:
-    print(f"serial fail {e}")
-    exit()
+# Degrees per second — higher = faster
+SPEED = {
+    0: 180,  # Base:     full 180° in 1 sec
+    1: 120,  # Shoulder: fast but slightly restrained
+    2: 160,  # Elbow
+}
 
-pygame.init()
-pygame.joystick.init()
-ds = pygame.joystick.Joystick(0)
-ds.init()
+INVERT = {
+    0: False,
+    1: False,
+    2: False
+}
 
+DEADZONE = {
+    'ABS_X':  2000,   # Tighter deadzone = more responsive
+    'ABS_Y':  2000,
+    'ABS_RX': 2000
+}
 
-def controller_logic():
-    global servo_pos, running
-    while running:
-        pygame.event.pump()
+UPDATE_HZ = 100
+UPDATE_INTERVAL = 1.0 / UPDATE_HZ
 
-        lx, ly = ds.get_axis(0), ds.get_axis(1)
-        rx = ds.get_axis(2)
+# Minimum angle change before sending command (lower = smoother but more serial traffic)
+MIN_DELTA = 0.3
+# ===================================
 
-        # base
-        if abs(lx) > 0.3:
-            ser.write(b'a' if lx < 0 else b'd')
-            servo_pos[0] += (-20 if lx < 0 else 20)
-
-        # shoulder
-        if abs(ly) > 0.3:
-            ser.write(b'w' if ly < 0 else b's')
-            servo_pos[1] += (3 if ly < 0 else -3)
-
-        # elbow
-        if abs(rx) > 0.3:
-            ser.write(b'q' if rx < 0 else b'e')
-            servo_pos[2] += (-15 if rx < 0 else 15)
-
-        # gripper on buttons so no snap back
-        if ds.get_button(4):
-            ser.write(b'j')
-            servo_pos[3] -= 25
-        elif ds.get_button(5):
-            ser.write(b'l')
-            servo_pos[3] += 25
-
-        # 5th servo on triangle/cross
-        if ds.get_button(2):
-            ser.write(b'u')
-            servo_pos[4] += 15
-        elif ds.get_button(0):
-            ser.write(b'i')
-            servo_pos[4] -= 15
-
-        # ps button reset
-        if ds.get_button(10):
-            ser.write(b'c')
-            servo_pos = [CENTER] * 5
-
-        # keep servos in range
-        for i in range(5):
-            servo_pos[i] = max(150, min(600, servo_pos[i]))
-
-        time.sleep(0.01)
+servo_positions = {0: 90.0, 1: 90.0, 2: 90.0}
+axis_values = {axis: 0 for axis in AXIS_MAP}
+axis_lock = threading.Lock()
+button_events = []
+button_lock = threading.Lock()
+stop_flag = threading.Event()
 
 
-threading.Thread(target=controller_logic, daemon=True).start()
+def gamepad_thread():
+    while not stop_flag.is_set():
+        try:
+            events = get_gamepad()
+            for event in events:
+                if event.ev_type == 'Absolute' and event.code in AXIS_MAP:
+                    with axis_lock:
+                        axis_values[event.code] = event.state
+                elif event.ev_type == 'Key' and event.state == 1:
+                    with button_lock:
+                        button_events.append(event.code)
+        except Exception:
+            time.sleep(0.005)
 
-# 3d view
-plt.ion()
-fig = plt.figure()
-ax = fig.add_subplot(111, projection='3d')
 
-try:
-    while True:
-        s = servo_pos[:]
-        ax.clear()
-        ax.set_xlim([-20, 20]);
-        ax.set_ylim([-20, 20]);
-        ax.set_zlim([0, 25])
+def get_rate(axis, value):
+    dead = DEADZONE.get(axis, 2000)
+    if abs(value) < dead:
+        return 0.0
+    sign = 1 if value > 0 else -1
+    # Smooth curve: ease in from deadzone edge
+    norm = (abs(value) - dead) / (32767.0 - dead)
+    norm = sign * min(norm, 1.0) ** 0.8   # <-- power < 1 = more responsive at low deflection
+    servo_id = AXIS_MAP[axis]
+    if INVERT.get(servo_id, False):
+        norm = -norm
+    return norm
 
-        # math for the 5 joints
-        r0, r1, r2, r4 = [np.radians((pos - 375) / 2.5) for pos in [s[0], s[1], s[2], s[4]]]
 
-        # build the arm lines
-        x, y, z = [0, 0], [0, 0], [0, 4]
+def main():
+    ser = None
+    try:
+        ser = serial.Serial(ARDUINO_PORT, BAUD_RATE, timeout=1)
+        time.sleep(2)
+        print(f"Connected to Arduino on {ARDUINO_PORT}")
+        print(f"Running at {UPDATE_HZ}Hz | Speeds: {SPEED} | Ctrl+C to exit\n")
 
-        # shoulder
-        x.append(x[-1] + 7 * np.cos(r1) * np.cos(r0))
-        y.append(y[-1] + 7 * np.cos(r1) * np.sin(r0))
-        z.append(z[-1] + 7 * np.sin(r1))
+        t = threading.Thread(target=gamepad_thread, daemon=True)
+        t.start()
 
-        # elbow
-        x.append(x[-1] + 5 * np.cos(r1 + r2) * np.cos(r0))
-        y.append(y[-1] + 5 * np.cos(r1 + r2) * np.sin(r0))
-        z.append(z[-1] + 5 * np.sin(r1 + r2))
+        last_time = time.perf_counter()
 
-        # wrist
-        x.append(x[-1] + 3 * np.cos(r1 + r2 + r4) * np.cos(r0))
-        y.append(y[-1] + 3 * np.cos(r1 + r2 + r4) * np.sin(r0))
-        z.append(z[-1] + 3 * np.sin(r1 + r2 + r4))
+        while True:
+            now = time.perf_counter()
+            sleep_time = UPDATE_INTERVAL - (now - last_time)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
 
-        ax.plot(x, y, z, 'bo-', lw=4)
-        plt.pause(0.03)
-except KeyboardInterrupt:
-    running = False
-    ser.close()
+            now = time.perf_counter()
+            dt = min(now - last_time, 0.05)  # cap dt to avoid jumps after lag spikes
+            last_time = now
+
+            # --- Buttons ---
+            with button_lock:
+                pending = button_events[:]
+                button_events.clear()
+
+            for code in pending:
+                if code == 'BTN_SOUTH':
+                    ser.write(b"CLAW_CLOSE\n")
+                    print("Claw CLOSE")
+                elif code == 'BTN_EAST':
+                    ser.write(b"CLAW_OPEN\n")
+                    print("Claw OPEN")
+                elif code == 'BTN_START':
+                    for sid in servo_positions:
+                        servo_positions[sid] = 90.0
+                    ser.write(b"HOME\n")
+                    print("All servos HOME")
+
+            # --- Servos ---
+            with axis_lock:
+                current_axes = axis_values.copy()
+
+            for axis, servo_id in AXIS_MAP.items():
+                rate = get_rate(axis, current_axes[axis])
+                if rate == 0.0:
+                    continue
+
+                delta = rate * SPEED[servo_id] * dt
+                new_pos = max(0.0, min(180.0, servo_positions[servo_id] + delta))
+
+                if abs(new_pos - servo_positions[servo_id]) >= MIN_DELTA:
+                    servo_positions[servo_id] = new_pos
+                    ser.write(f"S{servo_id} {int(round(new_pos))}\n".encode())
+
+    except serial.SerialException as e:
+        print(f"ERROR: Cannot open {ARDUINO_PORT} — {e}")
+    except KeyboardInterrupt:
+        print("\nExiting...")
+    finally:
+        stop_flag.set()
+        if ser and ser.is_open:
+            ser.close()
+
+
+if __name__ == "__main__":
+    main()
